@@ -416,86 +416,93 @@ const Statement: React.FC = () => {
     }
 
     try {
-        const dates = getDatesInRange(startDate, endDate);
-        const syncPromises = [];
+        const filteredOrders = orders.filter(order => {
+            const orderDate = new Date(order.date);
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            orderDate.setUTCHours(0, 0, 0, 0);
+            start.setUTCHours(0, 0, 0, 0);
+            end.setUTCHours(0, 0, 0, 0);
+            return orderDate >= start && orderDate <= end;
+        });
 
-        for (const date of dates) {
-            const dailyOrders = orders.filter(order => order.date === date);
-            if (dailyOrders.length === 0) continue;
-
-            const customerDateSummary = new Map<string, { date: string; customerName: string; products: Map<string, number>; totalAmount: number; }>();
-            for (const order of dailyOrders) {
-                const key = `${order.date}-${order.customer_id}`;
-                if (!customerDateSummary.has(key)) {
-                    customerDateSummary.set(key, { date: order.date, customerName: order.customer_name, products: new Map<string, number>(), totalAmount: 0 });
-                }
-                const summary = customerDateSummary.get(key)!;
-                summary.totalAmount += order.total_amount;
-                for (const item of order.items) {
-                    const currentQty = summary.products.get(item.product_name) || 0;
-                    summary.products.set(item.product_name, currentQty + item.quantity);
-                }
-            }
-
-            const dataToSync = Array.from(customerDateSummary.values()).map(summary => {
-                const productsOrdered = Array.from(summary.products.entries()).map(([name, qty]) => `${name} (x${qty})`).join(', ');
-                return {
-                    'ID': `${summary.date}-${summary.customerName.replace(/\s+/g, '_')}`,
-                    'Date': summary.date,
-                    'Customer_Name': summary.customerName,
-                    'Products_Ordered': productsOrdered,
-                    'Total_Amount': summary.totalAmount,
-                };
-            }).sort((a, b) => a.Customer_Name.localeCompare(b.Customer_Name));
-
-            if (dataToSync.length > 0) {
-                const urlWithSheet = `${sheetApiUrl}?sheet=${date}`;
-                const promise = fetch(urlWithSheet, {
-                    method: 'PUT',
-                    headers: headers,
-                    body: JSON.stringify({ data: dataToSync })
-                }).then(async response => {
-                    if (!response.ok) {
-                        const errorData = await response.json().catch(() => ({ error: 'Could not parse error response.' }));
-                        return Promise.reject({ status: response.status, data: errorData, date });
-                    }
-                    return response.json();
-                });
-                syncPromises.push(promise);
-            }
-        }
-
-        if (syncPromises.length === 0) {
-            setSyncStatus({ type: 'success', message: 'No new data to sync in the selected date range.' });
+        if (filteredOrders.length === 0) {
+            setSyncStatus({ type: 'success', message: 'No data to sync in the selected date range.' });
             setIsSyncing(false);
             return;
         }
 
-        const results = await Promise.allSettled(syncPromises);
-        const successfulSyncs = results.filter(r => r.status === 'fulfilled').length;
-        const failedSyncs = results.filter(r => r.status === 'rejected');
+        const summaryMap = new Map<string, {
+            date: string;
+            customerId: string;
+            customerName: string;
+            products: Map<string, number>;
+            totalAmount: number;
+            amountPaid: number;
+        }>();
 
-        if (failedSyncs.length === 0) {
-            setSyncStatus({ type: 'success', message: `Successfully synced data for ${successfulSyncs} day(s)!` });
-        } else {
-            const firstError = (failedSyncs[0] as PromiseRejectedResult).reason;
-            let errorMessage = 'An unexpected error occurred.';
-            if (firstError.status) {
-                if (firstError.status === 401) {
-                    errorMessage = 'Error 401: Unauthorized. Please check your API Username and Password.';
-                } else if (firstError.status === 405) {
-                    errorMessage = 'Error 405: Method Not Allowed. This usually means the API URL is incorrect. Please ensure you are using the API URL from a service like SheetDB, not the Google Sheets browser URL.';
-                } else if (firstError.data?.error) {
-                    errorMessage = `Sync failed: ${firstError.data.error}`;
-                } else {
-                    errorMessage = `Sync failed with status ${firstError.status}.`;
-                }
+        for (const order of filteredOrders) {
+            const key = `${order.date}-${order.customer_id}`;
+            if (!summaryMap.has(key)) {
+                summaryMap.set(key, {
+                    date: order.date,
+                    customerId: order.customer_id,
+                    customerName: order.customer_name,
+                    products: new Map<string, number>(),
+                    totalAmount: 0,
+                    amountPaid: 0,
+                });
             }
-            setSyncStatus({ type: 'error', message: `Synced ${successfulSyncs} of ${results.length} days. First error on sheet '${firstError.date}': ${errorMessage}` });
+            const summary = summaryMap.get(key)!;
+            summary.totalAmount += order.total_amount;
+            summary.amountPaid += order.amount_paid || 0;
+            for (const item of order.items) {
+                const currentQty = summary.products.get(item.product_name) || 0;
+                summary.products.set(item.product_name, currentQty + item.quantity);
+            }
         }
-    } catch (error) {
+
+        const dataToSync = Array.from(summaryMap.values()).map(summary => {
+            const productsOrdered = Array.from(summary.products.entries())
+                .map(([name, qty]) => `${name} (x${qty})`)
+                .join(', ');
+            return {
+                'ID': `${summary.date}-${summary.customerId}`,
+                'Date': summary.date,
+                'Customer_Name': summary.customerName,
+                'Products_Ordered': productsOrdered,
+                'Total_Amount': summary.totalAmount,
+                'Amount_Paid': summary.amountPaid,
+                'Pending_Amount': summary.totalAmount - summary.amountPaid,
+            };
+        });
+
+        const response = await fetch(sheetApiUrl, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ data: dataToSync })
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: 'Could not parse error response.' }));
+            let errorMessage = `Request failed with status ${response.status}.`;
+            if (response.status === 401) {
+                errorMessage = 'Error 401: Unauthorized. Please check your API Username and Password.';
+            } else if (response.status === 404) {
+                errorMessage = 'Error 404: Not Found. The API URL seems to be incorrect.';
+            } else if (response.status === 405) {
+                errorMessage = 'Error 405: Method Not Allowed. The API endpoint does not support the request method. This might be a configuration issue with the API service.';
+            } else if (errorData.error) {
+                errorMessage = `Sync failed: ${errorData.error}`;
+            }
+            throw new Error(errorMessage);
+        }
+
+        setSyncStatus({ type: 'success', message: `Successfully synced ${dataToSync.length} rows of data!` });
+
+    } catch (error: any) {
         console.error("Google Sheet sync failed:", error);
-        setSyncStatus({ type: 'error', message: 'A general error occurred during the sync process.' });
+        setSyncStatus({ type: 'error', message: error.message || 'A general error occurred during the sync process.' });
     } finally {
         setIsSyncing(false);
     }
@@ -652,18 +659,19 @@ const Statement: React.FC = () => {
           <h2 className="text-xl font-bold text-gray-800 mb-2">Google Sheets Sync</h2>
           <details className="mb-4">
             <summary className="cursor-pointer font-medium text-dairy-700 hover:text-dairy-800">Show Setup Instructions</summary>
-            <div className="mt-2 text-xs text-gray-500 bg-gray-50 p-3 rounded-lg">
-              <p className="mb-2">
-                Syncs a customer summary for each day in the selected date range. Each day will be a separate sheet named <code className="font-mono">YYYY-MM-DD</code>. Requires a free account from a service like <a href="https://sheetdb.io" target="_blank" rel="noopener noreferrer" className="text-dairy-600 font-medium underline">SheetDB</a>.
+            <div className="mt-2 text-xs text-gray-500 bg-gray-50 p-3 rounded-lg space-y-2">
+              <p>
+                This feature syncs all order summaries from the selected date range to a <strong>single sheet</strong> in your Google Sheet. It uses a service like <a href="https://sheetdb.io" target="_blank" rel="noopener noreferrer" className="text-dairy-600 font-medium underline">SheetDB</a>.
               </p>
-              <strong>Setup:</strong> Create a Google Sheet. The first row headers must be exactly: <br/>
-              <code className="font-mono">ID</code>, <code className="font-mono">Date</code>, <code className="font-mono">Customer_Name</code>, <code className="font-mono">Products_Ordered</code>, <code className="font-mono">Total_Amount</code>
+              <p><strong>Step 1:</strong> Create a Google Sheet. The first row must have these exact headers:</p>
+              <code className="font-mono bg-gray-200 p-1 rounded">ID, Date, Customer_Name, Products_Ordered, Total_Amount, Amount_Paid, Pending_Amount</code>
               <div className="mt-2 flex items-start">
                 <Key size={14} className="mr-2 mt-0.5 text-amber-600 flex-shrink-0" />
                 <div>
-                  <strong className="text-amber-700">CRITICAL TO PREVENT DUPLICATES:</strong> In your SheetDB API settings, set the <code className="font-mono">ID</code> column as the 'Key'. This allows the system to update existing rows instead of creating new ones.
+                  <strong className="text-amber-700">Step 2 (CRITICAL):</strong> In your SheetDB API settings, set the <code className="font-mono bg-gray-200 p-1 rounded">ID</code> column as the 'Key' (or 'Update by' column). This is essential to prevent creating duplicate rows on every sync.
                 </div>
               </div>
+               <p><strong>Step 3:</strong> Paste the API URL from SheetDB below.</p>
             </div>
           </details>
           <div className="space-y-4">
